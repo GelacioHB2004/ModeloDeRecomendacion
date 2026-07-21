@@ -1,99 +1,184 @@
-# app.py
-#
-# Microservicio Flask para servir el modelo de recomendación de productos.
-# Se despliega en Render (mismo patrón que el proyecto de Bike Sharing).
-#
-# Endpoints:
-#   GET /                                -> healthcheck
-#   GET /recomendar/<id_producto>        -> recomendaciones para un producto
-#   POST /recomendar-carrito             -> recomendaciones para varios productos (carrito)
+"""
+Microservicio de recomendación de productos — Dulcería Angelitos
+Carga las reglas de asociación (Apriori) generadas en el notebook
+01_recomendacion_productos.ipynb y las expone vía API REST para
+que el carrito de la tienda pida sugerencias de venta cruzada.
+"""
 
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-import pickle
 import os
+import pickle
+import logging
+from collections import defaultdict
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("recomendador")
 
 app = Flask(__name__)
-CORS(app)  # permite que el frontend/backend en otro dominio lo consuma
 
-MODELO_PATH = os.path.join(os.path.dirname(__file__), 'modelo_recomendador.pkl')
+# En producción, si quieres restringir a tu dominio del frontend en vez de "*",
+# usa: CORS(app, origins=["https://tu-tienda.com"])
+CORS(app)
 
-with open(MODELO_PATH, 'rb') as f:
-    modelo = pickle.load(f)
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "modelo_recomendador.pkl")
 
-print(f"Modelo cargado. Total de reglas: {modelo['metadata']['total_reglas']}")
+# ---------------------------------------------------------------------------
+# Carga del modelo al iniciar el servicio
+# ---------------------------------------------------------------------------
+
+modelo = None
+reglas_por_antecedente = defaultdict(list)  # nombre_producto -> [ {consecuente, id, confidence, lift, support}, ... ]
+mapa_nombre_a_id = {}
+mapa_id_a_nombre = {}
+metadata = {}
 
 
-def obtener_recomendaciones(id_producto, top_n=5):
-    nombre = modelo['mapa_id_a_nombre'].get(id_producto)
-    if nombre is None:
-        return []
+def cargar_modelo():
+    """Carga el .pkl y precalcula un índice por antecedente para respuestas rápidas."""
+    global modelo, mapa_nombre_a_id, mapa_id_a_nombre, metadata, reglas_por_antecedente
 
-    reglas = modelo['reglas']
-    coincidencias = reglas[reglas['antecedente'] == nombre].head(top_n)
+    with open(MODEL_PATH, "rb") as f:
+        modelo = pickle.load(f)
 
-    resultados = []
-    for _, fila in coincidencias.iterrows():
-        id_rec = modelo['mapa_nombre_a_id'].get(fila['consecuente'])
-        if id_rec is None:
-            continue
-        resultados.append({
-            'id_producto_recomendado': int(id_rec),
-            'nombre': fila['consecuente'],
-            'confianza': round(float(fila['confidence']), 4),
-            'lift': round(float(fila['lift']), 4)
+    mapa_nombre_a_id = dict(modelo["mapa_nombre_a_id"])
+    mapa_id_a_nombre = dict(modelo["mapa_id_a_nombre"])
+    metadata = dict(modelo["metadata"])
+
+    reglas_por_antecedente = defaultdict(list)
+    reglas_df = modelo["reglas"]
+
+    # Convertimos el DataFrame a estructuras nativas de Python una sola vez,
+    # aquí al inicio, para que el resto del servicio no dependa de pandas
+    # en cada request (más rápido y evita problemas de versiones en runtime).
+    for _, fila in reglas_df.iterrows():
+        antecedente = str(fila["antecedente"])
+        consecuente = str(fila["consecuente"])
+        reglas_por_antecedente[antecedente].append({
+            "producto": consecuente,
+            "id_producto": mapa_nombre_a_id.get(consecuente),
+            "support": float(fila["support"]),
+            "confidence": float(fila["confidence"]),
+            "lift": float(fila["lift"]),
         })
-    return resultados
+
+    # Cada lista de recomendaciones ordenada de mejor a peor (mayor lift primero)
+    for antecedente in reglas_por_antecedente:
+        reglas_por_antecedente[antecedente].sort(key=lambda r: r["lift"], reverse=True)
+
+    logger.info(
+        "Modelo cargado: %s reglas, %s productos con al menos una regla, entrenado con %s canastas.",
+        metadata.get("total_reglas"),
+        len(reglas_por_antecedente),
+        metadata.get("total_canastas_entrenamiento"),
+    )
 
 
-@app.route('/', methods=['GET'])
-def healthcheck():
+cargar_modelo()
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.route("/", methods=["GET"])
+def index():
     return jsonify({
-        'status': 'ok',
-        'modelo': 'recomendador_productos',
-        'total_reglas': modelo['metadata']['total_reglas']
+        "servicio": "Recomendador de productos - Dulcería Angelitos",
+        "estado": "activo",
+        "endpoints": {
+            "/salud": "GET - healthcheck",
+            "/recomendar": "POST - recibe {\"carrito\": [id_producto, ...]} y devuelve recomendaciones",
+        },
     })
 
 
-@app.route('/recomendar/<int:id_producto>', methods=['GET'])
-def recomendar(id_producto):
-    top_n = request.args.get('top_n', default=5, type=int)
-    recomendaciones = obtener_recomendaciones(id_producto, top_n)
-    return jsonify({
-        'id_producto_base': id_producto,
-        'total_recomendaciones': len(recomendaciones),
-        'recomendaciones': recomendaciones
-    })
+@app.route("/salud", methods=["GET"])
+def salud():
+    return jsonify({"estado": "ok", "reglas_cargadas": metadata.get("total_reglas", 0)})
 
 
-@app.route('/recomendar-carrito', methods=['POST'])
-def recomendar_carrito():
+@app.route("/recomendar", methods=["POST"])
+def recomendar():
     """
-    Body esperado: { "ids_productos": [1, 5, 8] }
-    Devuelve recomendaciones combinadas para todos los productos del carrito,
-    excluyendo los que ya están en el carrito, ordenadas por lift.
-    """
-    data = request.get_json(silent=True) or {}
-    ids_productos = data.get('ids_productos', [])
-    top_n = data.get('top_n', 6)
+    Body esperado (JSON):
+        { "carrito": [12, 5, 28] }     -> ids de producto ya en el carrito
+    También se acepta un solo producto:
+        { "producto_id": 12 }
 
-    combinadas = {}
-    for id_p in ids_productos:
-        for rec in obtener_recomendaciones(id_p, top_n=10):
-            id_rec = rec['id_producto_recomendado']
-            if id_rec in ids_productos:
+    Respuesta:
+        {
+          "recomendaciones": [
+            {"id_producto": 3, "nombre": "Cacahuate Grande", "confidence": 0.47, "lift": 1.26},
+            ...
+          ],
+          "con_reglas": true
+        }
+
+    Nota importante: este microservicio solo conoce las reglas de asociación,
+    no el estado actual del catálogo (Activo/Inactivo, stock, etc.). Como se
+    documentó en el notebook (sección 3.5), el backend/carrito que consuma
+    esta respuesta debe filtrar cualquier id_producto que ya no esté activo
+    o sin stock antes de mostrarlo al cliente.
+    """
+    body = request.get_json(silent=True) or {}
+
+    ids_carrito = body.get("carrito")
+    if ids_carrito is None:
+        producto_id = body.get("producto_id")
+        ids_carrito = [producto_id] if producto_id is not None else []
+
+    if not isinstance(ids_carrito, list) or len(ids_carrito) == 0:
+        return jsonify({
+            "error": "Envía 'carrito' (lista de id_producto) o 'producto_id' (un solo id) en el body JSON."
+        }), 400
+
+    try:
+        ids_carrito = [int(i) for i in ids_carrito]
+    except (TypeError, ValueError):
+        return jsonify({"error": "Los ids de producto deben ser enteros."}), 400
+
+    nombres_carrito = [mapa_id_a_nombre[i] for i in ids_carrito if i in mapa_id_a_nombre]
+
+    if not nombres_carrito:
+        return jsonify({
+            "recomendaciones": [],
+            "con_reglas": False,
+            "mensaje": "Ninguno de los ids enviados existe en el modelo (¿producto nuevo sin historial?).",
+        })
+
+    # Unimos las recomendaciones de cada producto del carrito, evitando duplicados
+    # y evitando recomendar algo que ya está en el carrito.
+    vistos = set()
+    recomendaciones = []
+    for nombre in nombres_carrito:
+        for regla in reglas_por_antecedente.get(nombre, []):
+            nombre_reco = regla["producto"]
+            id_reco = regla["id_producto"]
+
+            if id_reco in ids_carrito:
                 continue
-            if id_rec not in combinadas or rec['lift'] > combinadas[id_rec]['lift']:
-                combinadas[id_rec] = rec
+            if nombre_reco in vistos:
+                continue
 
-    resultado = sorted(combinadas.values(), key=lambda x: x['lift'], reverse=True)[:top_n]
+            vistos.add(nombre_reco)
+            recomendaciones.append({
+                "id_producto": id_reco,
+                "nombre": nombre_reco,
+                "confidence": round(regla["confidence"], 4),
+                "lift": round(regla["lift"], 4),
+            })
+
+    recomendaciones.sort(key=lambda r: r["lift"], reverse=True)
 
     return jsonify({
-        'total_recomendaciones': len(resultado),
-        'recomendaciones': resultado
+        "recomendaciones": recomendaciones,
+        "con_reglas": len(recomendaciones) > 0,
     })
 
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+if __name__ == "__main__":
+    # Uso local. En Render, gunicorn ejecuta la app (ver Procfile / start command).
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=True)
